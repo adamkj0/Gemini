@@ -1,5 +1,7 @@
 {
   "name": "Gemini Co-Drawing",
-  "description": "Sketch and prompt, Gemini brings your drawings to life! Co-create collaboratively with AI by sketching and prompting.",
-  "requestFramePermissions": []
+  "description": "Sketch and prompt using voice or text in Bahasa Melayu (KL). Gemini brings your drawings to life! Co-create collaboratively with AI by sketching and prompting.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
 }

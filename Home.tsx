@@ -5,7 +5,7 @@
 */
 /* tslint:disable */
 import React, {useEffect, useRef, useState} from 'react';
-import {GoogleGenAI} from '@google/genai';
+import {GoogleGenAI, Modality, LiveServerMessage} from '@google/genai';
 import {
   ChevronDown,
   LoaderCircle,
@@ -16,10 +16,23 @@ import {
   Undo2,
   Redo2,
   Download,
+  Settings,
+  Key,
+  Mic,
+  MicOff
 } from 'lucide-react';
 
-// Use the correct initialization with named parameter
-const ai = new GoogleGenAI({apiKey: process.env.API_KEY});
+interface AIStudio {
+  hasSelectedApiKey: () => Promise<boolean>;
+  openSelectKey: () => Promise<void>;
+}
+
+// Fixed global window augmentation to match requirement and fix build errors
+declare global {
+  interface Window {
+    aistudio: AIStudio;
+  }
+}
 
 function parseError(error: string) {
   const regex = /{"error":(.*)}/gm;
@@ -31,6 +44,16 @@ function parseError(error: string) {
   } catch (e) {
     return error;
   }
+}
+
+// Audio helpers
+function encode(bytes: Uint8Array) {
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }
 
 export default function Home() {
@@ -45,19 +68,145 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [showErrorModal, setShowErrorModal] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
-  // Use correct model names according to guidelines
   const [selectedModel, setSelectedModel] = useState('gemini-2.5-flash-image');
+  const [hasKey, setHasKey] = useState<boolean | null>(null);
+
+  // Voice states
+  const [isListening, setIsListening] = useState(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sessionPromiseRef = useRef<Promise<any> | null>(null);
 
   // History states
   const [undoStack, setUndoStack] = useState<string[]>([]);
   const [redoStack, setRedoStack] = useState<string[]>([]);
 
+  useEffect(() => {
+    checkApiKey();
+    return () => stopListening();
+  }, []);
+
+  const checkApiKey = async () => {
+    const exists = await window.aistudio.hasSelectedApiKey();
+    setHasKey(exists);
+  };
+
+  const handleSelectKey = async () => {
+    try {
+      await window.aistudio.openSelectKey();
+      // Assume successful selection to avoid race conditions
+      setHasKey(true);
+    } catch (err) {
+      console.error("Failed to open key selector", err);
+    }
+  };
+
+  // --- Optimized Voice Integration ---
+  const startListening = async () => {
+    if (isListening) return;
+    setIsListening(true);
+    
+    try {
+      // Create new instance to ensure latest API key from context is used
+      const activeAi = new GoogleGenAI({apiKey: process.env.API_KEY});
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({sampleRate: 16000});
+      audioContextRef.current = audioContext;
+      
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      const sessionPromise = activeAi.live.connect({
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        callbacks: {
+          onopen: () => {
+            const source = audioContext.createMediaStreamSource(stream);
+            // Smaller buffer size for lower latency
+            const processor = audioContext.createScriptProcessor(2048, 1, 1);
+            processorRef.current = processor;
+            
+            processor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              const l = inputData.length;
+              const int16 = new Int16Array(l);
+              for (let i = 0; i < l; i++) {
+                int16[i] = inputData[i] * 32768;
+              }
+              const pcmBlob = {
+                data: encode(new Uint8Array(int16.buffer)),
+                mimeType: 'audio/pcm;rate=16000',
+              };
+              // Always use the promise to send to avoid stale closures
+              sessionPromise.then(session => {
+                session.sendRealtimeInput({ media: pcmBlob });
+              });
+            };
+            
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+          },
+          onmessage: async (message: LiveServerMessage) => {
+            // Check for transcription in a smooth continuous way
+            if (message.serverContent?.inputTranscription) {
+              const text = message.serverContent.inputTranscription.text;
+              if (text) {
+                setPrompt(prev => {
+                   const lastChar = prev.slice(-1);
+                   const space = (prev.length > 0 && lastChar !== ' ') ? ' ' : '';
+                   return prev + space + text;
+                });
+              }
+            }
+          },
+          onclose: () => stopListening(),
+          onerror: (e) => {
+            console.error("Live API error", e);
+            stopListening();
+          },
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          inputAudioTranscription: {},
+          systemInstruction: 'Anda adalah transkrip bot. Dengar suara pengguna dan tukarkan kepada teks Bahasa Melayu KL yang santai (slang KL). Jangan jawab, jangan borak. Tulis apa yang didengar sahaja secara direct.',
+        }
+      });
+      
+      sessionPromiseRef.current = sessionPromise;
+    } catch (err) {
+      console.error("Voice start error:", err);
+      stopListening();
+    }
+  };
+
+  const stopListening = () => {
+    setIsListening(false);
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    sessionPromiseRef.current = null;
+  };
+
+  const toggleListening = () => {
+    if (isListening) stopListening();
+    else startListening();
+  };
+
+  // --- Canvas Logic ---
   const saveState = () => {
     if (!canvasRef.current) return;
     const canvas = canvasRef.current;
     const state = canvas.toDataURL();
     setUndoStack((prev) => [...prev, state]);
-    setRedoStack([]); // Clear redo stack on new action
+    setRedoStack([]);
   };
 
   const loadState = (dataUrl: string) => {
@@ -77,7 +226,6 @@ export default function Home() {
     if (undoStack.length === 0 || !canvasRef.current) return;
     const currentState = canvasRef.current.toDataURL();
     const previousState = undoStack[undoStack.length - 1];
-    
     setRedoStack((prev) => [...prev, currentState]);
     setUndoStack((prev) => prev.slice(0, -1));
     loadState(previousState);
@@ -87,13 +235,11 @@ export default function Home() {
     if (redoStack.length === 0 || !canvasRef.current) return;
     const currentState = canvasRef.current.toDataURL();
     const nextState = redoStack[redoStack.length - 1];
-
     setUndoStack((prev) => [...prev, currentState]);
     setRedoStack((prev) => prev.slice(0, -1));
     loadState(nextState);
   };
 
-  // Load background image when generatedImage changes
   useEffect(() => {
     if (generatedImage && canvasRef.current) {
       const img = new window.Image();
@@ -106,7 +252,6 @@ export default function Home() {
     }
   }, [generatedImage]);
 
-  // Initialize canvas with white background when component mounts
   useEffect(() => {
     if (canvasRef.current) {
       initializeCanvas();
@@ -124,19 +269,15 @@ export default function Home() {
 
   const drawImageToCanvas = () => {
     if (!canvasRef.current || !backgroundImageRef.current) return;
-
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-
     const img = backgroundImageRef.current;
     const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
     const x = (canvas.width / 2) - (img.width / 2) * scale;
     const y = (canvas.height / 2) - (img.height / 2) * scale;
-
     ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
   };
 
@@ -146,10 +287,8 @@ export default function Home() {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
-
     const clientX = e.clientX || (e.touches && e.touches[0].clientX);
     const clientY = e.clientY || (e.touches && e.touches[0].clientY);
-
     return {
       x: (clientX - rect.left) * scaleX,
       y: (clientY - rect.top) * scaleY,
@@ -158,13 +297,11 @@ export default function Home() {
 
   const startDrawing = (e: any) => {
     saveState();
-
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const {x, y} = getCoordinates(e);
-
     ctx.beginPath();
     ctx.moveTo(x, y);
     setIsDrawing(true);
@@ -172,13 +309,11 @@ export default function Home() {
 
   const draw = (e: any) => {
     if (!isDrawing) return;
-
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const {x, y} = getCoordinates(e);
-
     ctx.lineWidth = 5;
     ctx.lineCap = 'round';
     ctx.strokeStyle = penColor;
@@ -186,9 +321,7 @@ export default function Home() {
     ctx.stroke();
   };
 
-  const stopDrawing = () => {
-    setIsDrawing(false);
-  };
+  const stopDrawing = () => setIsDrawing(false);
 
   const clearCanvas = () => {
     saveState(); 
@@ -214,23 +347,9 @@ export default function Home() {
     }
   };
 
-  const triggerFileUpload = () => {
-    fileInputRef.current?.click();
-  };
-
-  const handleColorChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setPenColor(e.target.value);
-  };
-
-  const openColorPicker = () => {
-    colorInputRef.current?.click();
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      openColorPicker();
-    }
-  };
+  const triggerFileUpload = () => fileInputRef.current?.click();
+  const handleColorChange = (e: React.ChangeEvent<HTMLInputElement>) => setPenColor(e.target.value);
+  const openColorPicker = () => colorInputRef.current?.click();
 
   const handleExport = () => {
     if (!canvasRef.current) return;
@@ -245,22 +364,11 @@ export default function Home() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!canvasRef.current) return;
-
     setIsLoading(true);
     try {
       const canvas = canvasRef.current;
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = canvas.width;
-      tempCanvas.height = canvas.height;
-      const tempCtx = tempCanvas.getContext('2d');
-      if (!tempCtx) return;
-      tempCtx.fillStyle = '#FFFFFF';
-      tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
-      tempCtx.drawImage(canvas, 0, 0);
-
-      const drawingData = tempCanvas.toDataURL('image/png').split(',')[1];
-
-      // Re-initialize AI to avoid potential issues with key lifecycle
+      const drawingData = canvas.toDataURL('image/png').split(',')[1];
+      // Create new instance to ensure latest API key is used
       const activeAi = new GoogleGenAI({apiKey: process.env.API_KEY});
 
       const response = await activeAi.models.generateContent({
@@ -268,13 +376,12 @@ export default function Home() {
         contents: {
           parts: [
             {inlineData: {data: drawingData, mimeType: 'image/png'}},
-            {text: `${prompt}. Use the provided image as context. Keep the style consistent with the input.`}
+            {text: `${prompt}. Sila gunakan Bahasa Melayu KL jika ada teks dalam imej. Gunakan input ini sebagai konteks.`}
           ]
         }
       });
 
       let imageData = null;
-
       if (response.candidates?.[0]?.content?.parts) {
         for (const part of response.candidates[0].content.parts) {
           if (part.inlineData) {
@@ -285,40 +392,46 @@ export default function Home() {
       }
 
       if (imageData) {
-        const imageUrl = `data:image/png;base64,${imageData}`;
-        setGeneratedImage(imageUrl);
+        setGeneratedImage(`data:image/png;base64,${imageData}`);
       } else {
-        alert('Failed to generate image. No image data returned. Please try a different prompt.');
+        alert('Maaf, imej tidak berjaya dihasilkan.');
       }
     } catch (error: any) {
-      console.error('Error submitting drawing:', error);
-      setErrorMessage(error.message || 'An unexpected error occurred.');
+      const msg = error.message || '';
+      // Reset key selection if entity not found error occurs
+      if (msg.includes("Requested entity was not found")) {
+        setHasKey(false);
+        setErrorMessage("Sesi kunci API tamat atau tidak sah.");
+      } else {
+        setErrorMessage(msg || 'Ralat tidak dijangka berlaku.');
+      }
       setShowErrorModal(true);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const closeErrorModal = () => {
-    setShowErrorModal(false);
-  };
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const preventTouchDefault = (e: TouchEvent) => {
-      if (isDrawing) e.preventDefault();
-    };
-
-    canvas.addEventListener('touchstart', preventTouchDefault, {passive: false});
-    canvas.addEventListener('touchmove', preventTouchDefault, {passive: false});
-    
-    return () => {
-      canvas.removeEventListener('touchstart', preventTouchDefault);
-      canvas.removeEventListener('touchmove', preventTouchDefault);
-    };
-  }, [isDrawing]);
+  if (hasKey === false) {
+    return (
+      <div className="min-h-screen bg-white flex flex-col items-center justify-center p-6 text-center">
+        <div className="max-w-md w-full border-4 border-black p-8 shadow-[8px_8px_0px_0px_rgba(0,0,0,1)]">
+          <Key className="w-16 h-16 mx-auto mb-6 text-black" />
+          <h1 className="text-2xl font-bold mb-4">Kunci API Diperlukan</h1>
+          <p className="text-gray-600 mb-6 font-mono text-sm">
+            Sila pilih kunci API dari projek GCP yang berbayar untuk kualiti terbaik.
+          </p>
+          <div className="space-y-4">
+            <button onClick={handleSelectKey} className="w-full bg-black text-white font-bold py-3 px-6 hover:bg-gray-800 transition-colors">
+              Pilih Kunci API
+            </button>
+            <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="block text-sm underline text-gray-500 hover:text-black">
+              Dokumentasi Pembayaran
+            </a>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -330,66 +443,45 @@ export default function Home() {
                 Gemini Co-Drawing
               </h1>
               <p className="text-sm sm:text-base text-gray-500 mt-1">
-                Built with{' '}
-                <a className="underline" href="https://ai.google.dev/gemini-api/docs/image-generation" target="_blank" rel="noopener noreferrer">
-                  Gemini native image generation
-                </a>
-              </p>
-              <p className="text-sm sm:text-base text-gray-500 mt-1">
-                by{' '}
-                <a className="underline" href="https://x.com/trudypainter" target="_blank" rel="noopener noreferrer">@trudypainter</a>{' '}
-                and{' '}
-                <a className="underline" href="https://x.com/alexanderchen" target="_blank" rel="noopener noreferrer">@alexanderchen</a>
+                Kreativiti AI Kolaboratif (Bahasa Melayu)
               </p>
             </div>
 
             <menu className="flex items-center bg-gray-300 rounded-full p-2 shadow-sm self-start sm:self-auto gap-2">
-              <div className="relative mr-1">
-                <select
-                  value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value)}
-                  className="h-10 rounded-full bg-white pl-3 pr-8 text-sm text-gray-700 shadow-sm transition-all hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-400 appearance-none border-2 border-white"
-                  aria-label="Select Gemini Model">
-                  <option value="gemini-2.5-flash-image">2.5 Flash Image</option>
-                  <option value="gemini-3-pro-image-preview">3.0 Pro Image (High Quality)</option>
-                </select>
-                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
-                  <ChevronDown className="w-5 h-5" />
+              <div className="flex items-center gap-1">
+                <div className="relative">
+                  <select
+                    value={selectedModel}
+                    onChange={(e) => setSelectedModel(e.target.value)}
+                    className="h-10 rounded-full bg-white pl-3 pr-8 text-sm text-gray-700 shadow-sm transition-all hover:bg-gray-50 appearance-none border-2 border-white"
+                  >
+                    <option value="gemini-2.5-flash-image">2.5 Flash</option>
+                    <option value="gemini-3-pro-image-preview">3.0 Pro (HQ)</option>
+                  </select>
+                  <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+                    <ChevronDown className="w-4 h-4" />
+                  </div>
                 </div>
+                
+                <button onClick={handleSelectKey} title="Tetapan API" className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm hover:scale-110">
+                  <Settings className="w-5 h-5 text-gray-700" />
+                </button>
               </div>
 
+              <div className="h-6 w-px bg-gray-400 mx-1" />
+
               <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={undo}
-                  disabled={undoStack.length === 0}
-                  title="Undo"
-                  className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm transition-all hover:bg-gray-50 hover:scale-110 disabled:opacity-30 disabled:pointer-events-none">
+                <button onClick={undo} disabled={undoStack.length === 0} className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm disabled:opacity-30">
                   <Undo2 className="w-5 h-5 text-gray-700" />
                 </button>
-                <button
-                  type="button"
-                  onClick={redo}
-                  disabled={redoStack.length === 0}
-                  title="Redo"
-                  className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm transition-all hover:bg-gray-50 hover:scale-110 disabled:opacity-30 disabled:pointer-events-none">
+                <button onClick={redo} disabled={redoStack.length === 0} className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm disabled:opacity-30">
                   <Redo2 className="w-5 h-5 text-gray-700" />
                 </button>
               </div>
 
               <div className="flex items-center gap-1">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={handleFileUpload}
-                />
-                <button
-                  type="button"
-                  onClick={triggerFileUpload}
-                  title="Upload Image"
-                  className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm transition-all hover:bg-gray-50 hover:scale-110">
+                <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileUpload} />
+                <button onClick={triggerFileUpload} className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm hover:scale-110">
                   <ImageUp className="w-5 h-5 text-gray-700" />
                 </button>
 
@@ -397,39 +489,22 @@ export default function Home() {
                   type="button"
                   className="w-10 h-10 rounded-full overflow-hidden flex items-center justify-center border-2 border-white shadow-sm transition-transform hover:scale-110"
                   onClick={openColorPicker}
-                  onKeyDown={handleKeyDown}
-                  aria-label="Open color picker"
                   style={{backgroundColor: penColor}}>
-                  <input
-                    ref={colorInputRef}
-                    type="color"
-                    value={penColor}
-                    onChange={handleColorChange}
-                    className="opacity-0 absolute w-px h-px"
-                  />
+                  <input ref={colorInputRef} type="color" value={penColor} onChange={handleColorChange} className="opacity-0 absolute w-px h-px" />
                 </button>
 
-                <button
-                  type="button"
-                  onClick={handleExport}
-                  title="Download Image"
-                  className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm transition-all hover:bg-gray-50 hover:scale-110 group relative"
-                  aria-label="Download Image">
+                <button onClick={handleExport} title="Muat Turun" className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm">
                   <Download className="w-5 h-5 text-gray-700" />
                 </button>
                 
-                <button
-                  type="button"
-                  onClick={clearCanvas}
-                  className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm transition-all hover:bg-gray-50 hover:scale-110"
-                  title="Clear Canvas">
-                  <Trash2 className="w-5 h-5 text-gray-700" aria-label="Clear Canvas" />
+                <button onClick={clearCanvas} className="w-10 h-10 rounded-full flex items-center justify-center bg-white shadow-sm">
+                  <Trash2 className="w-5 h-5 text-gray-700" />
                 </button>
               </div>
             </menu>
           </div>
 
-          <div className="w-full mb-6">
+          <div className="w-full mb-6 relative group">
             <canvas
               ref={canvasRef}
               width={960}
@@ -451,34 +526,43 @@ export default function Home() {
                 type="text"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
-                placeholder="What should Gemini add or change?"
-                className="w-full p-3 sm:p-4 pr-12 sm:pr-14 text-sm sm:text-base border-2 border-black bg-white text-gray-800 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] focus:outline-none focus:translate-x-[2px] focus:translate-y-[2px] focus:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] transition-all font-mono"
+                placeholder="Lakar sesuatu, kemudian guna suara KL..."
+                className="w-full p-4 pr-28 text-base border-2 border-black bg-white text-gray-800 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] focus:outline-none focus:translate-x-[2px] focus:translate-y-[2px] focus:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] transition-all font-mono"
                 required
               />
-              <button
-                type="submit"
-                disabled={isLoading}
-                className="absolute right-3 sm:right-4 top-1/2 -translate-y-1/2 p-1.5 sm:p-2 rounded-none bg-black text-white hover:cursor-pointer hover:bg-gray-800 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors">
-                {isLoading ? (
-                  <LoaderCircle className="w-5 sm:w-6 h-5 sm:h-6 animate-spin" aria-label="Loading" />
-                ) : (
-                  <SendHorizontal className="w-5 sm:w-6 h-5 sm:h-6" aria-label="Submit" />
-                )}
-              </button>
+              <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={toggleListening}
+                  className={`p-2.5 rounded-full transition-all duration-300 ${isListening ? 'bg-red-500 text-white shadow-[0_0_15px_rgba(239,68,68,0.5)] scale-110' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+                  title={isListening ? 'Berhenti mendengar' : 'Guna suara (KL)'}
+                >
+                  {isListening ? <MicOff className="w-5 h-5 animate-pulse" /> : <Mic className="w-5 h-5" />}
+                </button>
+                <button
+                  type="submit"
+                  disabled={isLoading}
+                  className="p-2 rounded-none bg-black text-white hover:bg-gray-800 disabled:bg-gray-300 transition-colors">
+                  {isLoading ? <LoaderCircle className="w-6 h-6 animate-spin" /> : <SendHorizontal className="w-6 h-6" />}
+                </button>
+              </div>
             </div>
           </form>
         </main>
 
         {showErrorModal && (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-            <div className="bg-white border-4 border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] max-w-md w-full p-6">
+            <div className="bg-white border-4 border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] max-w-md w-full p-6 animate-in zoom-in duration-200">
               <div className="flex justify-between items-start mb-4">
-                <h3 className="text-xl font-bold text-gray-700">Failed to generate</h3>
-                <button onClick={closeErrorModal} className="text-gray-400 hover:text-gray-500">
+                <h3 className="text-xl font-bold">Perhatian!</h3>
+                <button onClick={() => setShowErrorModal(false)} className="text-gray-400 hover:text-black">
                   <X className="w-5 h-5" />
                 </button>
               </div>
-              <p className="font-medium text-gray-600">{parseError(errorMessage)}</p>
+              <p className="text-gray-600 font-medium mb-6">{parseError(errorMessage)}</p>
+              <button onClick={() => setShowErrorModal(false)} className="w-full bg-black text-white font-bold py-2 hover:bg-gray-800">
+                Faham
+              </button>
             </div>
           </div>
         )}
